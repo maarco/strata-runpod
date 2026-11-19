@@ -708,6 +708,22 @@ check "says how to start a new one" 'echo "$out" | grep -q "strata-on"'
 check "no Strata probe of a dead pod" '! grep -q "strata.test" "$STUB/calls.log"'
 check "record cleared" '[ ! -f "$STRATA_CONF_DIR/pods/1.json" ]'
 
+echo "== T52: --name works after other flags (strata-on / strata-off / strata-status)"
+setup
+export FAKE_POD_ID=fake456
+routes <<EOF
+{"GET rp.test/v2/pods/fake456": [$POD456], "PATCH rp.test/v2/pods/fake456": [$POD456],
+ "GET fake456.strata.test/v1/models": [$LOADED456], "POST fake456.strata.test/v1/messages": [$MSG_OK],
+ "DELETE rp.test/v2/pods/fake456": [{"code":204,"body":""}]}
+EOF
+out=$("$POD" on --hours 1 --name 2 2>&1); rc=$?
+unset FAKE_POD_ID
+check "on: exit 0" '[ $rc = 0 ]'
+check "on: pod file 2" '[ "$(state_pod 2)" = fake456 ] && [ ! -f "$STRATA_CONF_DIR/pods/1.json" ]'
+check "on: ttl 1h" 'grep -qx "fake456 1" "$STUB/ttl.log"'
+"$POD" off --keep --name 2 >/dev/null 2>&1 || true
+check "off --keep --name 2 targeted pod 2" 'calls | grep "/action" | grep -q stop'
+
 python3 -c 'import glob,shutil,sys; [shutil.rmtree(d) for d in glob.glob(sys.argv[1] + "/t.*")]' "$WORK"
 echo
 echo "passed $passes, failed $fails"

@@ -50,7 +50,7 @@ strata-off               # stop paying
 
 ### Several pods at once
 
-Every command takes a leading `--name N`, or set `STRATA_POD=N` once per terminal. No name means pod `1`.
+Every command takes `--name N` (for `strata-cc` and `strata-codex` it must come first), or set `STRATA_POD=N` once per terminal. No name means pod `1`.
 
 ```sh
 strata-on --name 2       # a second pod

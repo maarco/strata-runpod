@@ -594,7 +594,23 @@ case "$name" in
   *) sub="${1:-help}"; shift || true ;;
 esac
 NAME_EXPLICIT=0
-if [[ "${1:-}" == --name ]]; then
+# --name N anywhere for our own commands; strata-cc / strata-codex pass the rest to claude / codex, so there
+# only a leading --name is ours
+if [[ "$sub" != cc && "$sub" != codex ]]; then
+  rest=()
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == --name ]]; then
+      [[ $# -ge 2 ]] || die "--name needs a value"
+      use_pod "$2"; NAME_EXPLICIT=1; shift 2
+    else
+      rest+=("$1"); shift
+    fi
+  done
+  set -- ${rest[@]+"${rest[@]}"}
+fi
+if (( NAME_EXPLICIT )); then
+  :
+elif [[ "${1:-}" == --name ]]; then
   [[ $# -ge 2 ]] || die "--name needs a value"
   use_pod "$2"; NAME_EXPLICIT=1; shift 2
 elif [[ -n "${STRATA_POD:-}" ]]; then
