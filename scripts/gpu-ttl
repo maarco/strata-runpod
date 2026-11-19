@@ -8,13 +8,18 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT_DIR/scripts/lib/common.sh"
 
 if [[ "${1:-}" == "--cancel" ]]; then
-  pidf="$(runtime_file "ttl-$2.pid")"
-  if [[ -f "$pidf" ]]; then
-    pid="$(cat "$pidf")"
+  id="${2:?pod_id}"
+  # every timer for this pod, found by its command line (DELETE '/pods/<id>'), not by a pid file: a pid file
+  # lives in one checkout's .runtime, and a timer armed from another checkout (an older install) was missed
+  # and later terminated a pod that had been extended (2026-11-18).
+  n=0
+  for pid in $(pgrep -f "DELETE '/pods/$id'" 2>/dev/null || true); do
     pkill -P "$pid" 2>/dev/null || true      # its sleep child, or it lingers as an orphan
     kill "$pid" 2>/dev/null || true
-    rm -f "$pidf"; info "ttl cancelled for $2"
-  fi
+    n=$((n + 1))
+  done
+  rm -f "$(runtime_file "ttl-$id.pid")"
+  info "ttl cancelled for $id ($n timer(s))"
   exit 0
 fi
 
@@ -29,4 +34,5 @@ nohup bash -c "
   if runpod_api DELETE '/pods/$id' >/dev/null 2>&1; then echo \"\$(date) terminated $id\"; else echo \"\$(date) FAILED to terminate $id\"; fi
 " >> "$log" 2>&1 &
 echo "$!" > "$(runtime_file "ttl-$id.pid")"
-info "pod $id will be terminated at $(date -v+${secs}S '+%H:%M') (log: .runtime/ttl-$id.log)"
+at="$(python3 -c "import time,sys;print(time.strftime('%H:%M',time.localtime(time.time()+int(sys.argv[1]))))" "$secs")"   # date -v is macOS-only
+info "pod $id will be terminated at $at (log: .runtime/ttl-$id.log)"
