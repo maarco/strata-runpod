@@ -39,8 +39,8 @@ speed under real use is unmeasured. vLLM reads prompts ~7x faster than Strata on
   cannot set either. Plan: `--engram-config '{"cpu_offload": false}'` keeps the tables on the GPUs (vLLM docs: Qwen
   PLE tables are ETP-sharded and honor cpu_offload). Estimate ~63 GB per card, ~28 GB per card left for KV cache.
 - `/dev/shm` size on a RunPod pod (vLLM TP workers use it); NCCL has a socket fallback if it is too small.
-- The fixed chat template (`chat_template/qwen38_flash_next.jinja`, 9.6 KB) has to reach the container: override
-  the entrypoint with a small `bash -c` that writes it from an env var, then `exec vllm serve`.
+- The fixed chat template (9.6 KB, NVIDIA Open Model License, so not copied here) reaches the container through
+  `profiles/vllm-start.sh`: it downloads it from the recipe's pinned commit, checks its sha256, then `exec vllm serve`.
 - Claude Code: vLLM serves `/v1/messages` natively (no LiteLLM); check the streamed reasoning/answer split that
   broke LiteLLM 1.94 (the recipe's `scripts/check_messages_stream.py`).
 - Weights: `nvidia/Qwen3.8-Flash-Next-NVFP4` @ `fc694b54`, ungated, 132.7 GB: a 200 GB volume, ~30 min download.
