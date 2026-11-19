@@ -16,7 +16,7 @@ You need a RunPod account with credit and an API key (runpod.io > Settings > API
 macOS or Linux with `bash`, `curl`, `python3`, `openssl`. Claude Code and/or Codex if you want them.
 
 ```sh
-git clone <this repo> ~/strata-runpod && cd ~/strata-runpod
+git clone https://github.com/maarco/strata-runpod ~/strata-runpod && cd ~/strata-runpod
 bash install.sh          # links the strata-* commands into ~/.local/bin
 strata-pod setup         # paste your RunPod API key once (or: export RUNPOD_API_KEY=...)
 strata-on                # rents a GPU and starts Strata (first start ~25 min: 77 GB download)
@@ -118,4 +118,4 @@ bash tests/test-runpod-ssh-target.sh
 ## Credits
 
 Strata is by [Niko1221](https://github.com/Niko1221/Strata); the model is Qwen3.8-Flash-Next by Qwen. This repo only
-rents the GPU and wires the clients. See [ROADMAP.md](ROADMAP.md) for the multi-user (Blackwell / vLLM) phase.
+rents the GPU and wires the clients. MIT license (see LICENSE). See [ROADMAP.md](ROADMAP.md) for the multi-user (Blackwell / vLLM) phase.
