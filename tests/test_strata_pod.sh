@@ -25,7 +25,8 @@ setup() {
   cat > "$STRATA_LCR/scripts/gpu-hunt-many" <<'EOF'
 #!/bin/bash
 printf '%s\n' "cards=$1" "args=${*:2}" "PROFILE=${PROFILE:-}" "POD_ENV=${RUNPOD_POD_ENV:-}" \
-  "INSTANCE_NAME=${INSTANCE_NAME:-}" "HUNT_RUN=${HUNT_RUN:-}" "RESULT=${HUNT_RESULT_FILE:-}" > "$STUB/hunt.log"
+  "INSTANCE_NAME=${INSTANCE_NAME:-}" "HUNT_RUN=${HUNT_RUN:-}" "RESULT=${HUNT_RESULT_FILE:-}" \
+  "RUNPOD_API_KEY=${RUNPOD_API_KEY:-}" > "$STUB/hunt.log"
 [ "${HUNT_FAIL:-0}" = 1 ] && { echo "no gpu caught; nothing billed" >&2; exit 1; }
 [ -n "${HUNT_RESULT_FILE:-}" ] || { echo "no HUNT_RESULT_FILE" >&2; exit 1; }
 echo "{\"id\":\"${FAKE_POD_ID:-fake123}\",\"gpu\":{\"id\":\"NVIDIA GeForce RTX 5080\"}}" > "$HUNT_RESULT_FILE"
@@ -33,6 +34,7 @@ EOF
   cat > "$STRATA_LCR/scripts/gpu-ttl" <<'EOF'
 #!/bin/bash
 echo "$*" >> "$STUB/ttl.log"
+echo "${RUNPOD_API_KEY:-}" >> "$STUB/ttl.key"
 EOF
   chmod +x "$STRATA_LCR/scripts/"*
   cat > "$T/bin/codex" <<'EOF'
@@ -596,6 +598,29 @@ printf '#!/bin/bash\necho '"'"'{"balance": 4.0, "spend_per_hr": 0, "pods": []}'"
 out=$(STRATA_STATUS_CMD="$T/bin/fake-status" python3 "$HERE/../bin/strata-dash" --once 2>&1); rc=$?
 check "exit 0" '[ $rc = 0 ]'
 check "names strata-on" 'echo "$out" | grep -q "strata-on"'
+
+echo "== T43: key only in runpod.env (strata-pod setup) reaches the hunt and the auto-terminate timer"
+setup
+: > "$STRATA_LCR/.env"
+mkdir -p "$STRATA_CONF_DIR"; umask 077; echo "RUNPOD_API_KEY=conf-key-43" > "$STRATA_CONF_DIR/runpod.env"; umask 022
+routes <<EOF
+{"GET rp.test/v2/pods/fake123": [$POD_RUNNING], "PATCH rp.test/v2/pods/fake123": [$POD_RUNNING],
+ "GET fake123.strata.test/v1/models": [$LOADED], "POST fake123.strata.test/v1/messages": [$MSG_OK]}
+EOF
+"$POD" on >/dev/null 2>&1; rc=$?
+check "exit 0" '[ $rc = 0 ]'
+check "hunt got the key" 'grep -qx "RUNPOD_API_KEY=conf-key-43" "$STUB/hunt.log"'
+check "timer got the key (else it cannot terminate the pod)" 'grep -qx "conf-key-43" "$STUB/ttl.key"'
+
+echo "== T44: no RunPod key anywhere -> strata-on says so before hunting"
+setup
+: > "$STRATA_LCR/.env"
+routes <<< '{}'
+out=$("$POD" on 2>&1); rc=$?
+check "exit non-zero" '[ $rc != 0 ]'
+check "says the key is missing" 'echo "$out" | grep -q "RUNPOD_API_KEY is not set"'
+check "does not claim a hunt ran" '! echo "$out" | grep -qi "no GPU caught"'
+check "no hunt" '[ ! -f "$STUB/hunt.log" ]'
 
 python3 -c 'import glob,shutil,sys; [shutil.rmtree(d) for d in glob.glob(sys.argv[1] + "/t.*")]' "$WORK"
 echo

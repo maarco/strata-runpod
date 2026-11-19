@@ -93,6 +93,8 @@ load_runpod_key() {   # the shell profile exports RUNPOD_API_KEY; llm-cloud-runt
     RP_KEY="$(grep -E '^RUNPOD_API_KEY=' "$f" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'")" || true
   done
   [[ -n "$RP_KEY" ]] || die "RUNPOD_API_KEY is not set. Run: strata-pod setup   (or export RUNPOD_API_KEY=...)"
+  # the hunt and the detached auto-terminate timer read it from the environment, wherever it was found
+  export RUNPOD_API_KEY="$RP_KEY"
 }
 rp() { load_runpod_key; http "$1" "$RP_BASE$2" "$RP_KEY" "${3:-}"; }
 
@@ -124,6 +126,7 @@ PY
 state_clear() { rm -f "$STATE"; }
 
 ttl_arm() {   # ttl_arm POD HOURS
+  load_runpod_key
   "$LCR/scripts/gpu-ttl" "$1" "$2" >&2
   state_set ttl_until "$(python3 -c "import time,sys;print(time.strftime('%Y-%m-%d %H:%M',time.localtime(time.time()+float(sys.argv[1])*3600)))" "$2")"
 }
@@ -257,6 +260,7 @@ cmd_on() {
   [[ "$context" == auto || -n "$(context_tokens "$context")" ]] \
     || die "--context takes auto, a size like 64k / 128k / 256k, or a token count (got: $context)"
   ensure_key
+  load_runpod_key
   POD="$(state_get pod_id)"
   local fresh=0 restarted=0 status
   if [[ -n "$POD" ]]; then
