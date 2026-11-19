@@ -37,6 +37,7 @@ strata-off               # stop paying
 | `strata-on --context 64k` | context size: `64k`, `128k` (default), `256k`, a token count, or `auto` (Strata picks) |
 | `strata-on --hours 8` | auto-terminate after 8 h (default 3) |
 | `strata-on --cards "NVIDIA GeForce RTX 4080"` | which GPUs to try (default: 5080, 4080 SUPER, 4080, all 16 GB) |
+| `strata-on --engine vllm` | several users at once: vLLM on 2x RTX PRO 6000 (~$3.38/hr; built, not yet run on a real pod: see ROADMAP.md) |
 | `strata-cc [claude args]` | Claude Code against the pod |
 | `strata-codex [codex args]` | Codex CLI against the pod |
 | `strata-dash` | live status window (`--once` prints one snapshot) |
@@ -109,6 +110,8 @@ export ANTHROPIC_AUTH_TOKEN=... OPENAI_API_KEY=...                   # the same 
 ```sh
 bash tests/test_strata_pod.sh      # offline: a fake RunPod/Strata, nothing can rent or spend
 bash tests/test_install.sh
+bash tests/test_payload.sh         # the real RunPod create request per profile (dry run)
+bash tests/test_ttl.sh             # auto-terminate timers (real processes that only sleep)
 bash tests/test-runpod-ssh-target.sh
 ```
 

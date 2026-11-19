@@ -46,12 +46,18 @@ speed under real use is unmeasured. vLLM reads prompts ~7x faster than Strata on
 - Weights: `nvidia/Qwen3.8-Flash-Next-NVFP4` @ `fc694b54`, ungated, 132.7 GB: a 200 GB volume, ~30 min download.
 - Auth: `--api-key` (vLLM), same 48-char key scheme as Phase 1.
 
-### Plan
+### Status (2026-11-19)
 
-1. `RUNPOD_ARGS` / entrypoint support in the pod payload; `profiles/vllm.env` (image pinned by digest).
-2. `strata-on --engine vllm` (2-GPU hunt, health = vLLM `/v1/models` `max_model_len`), same commands after that.
-3. A concurrency bench with Claude-Code-sized prompts (26-40k tokens) at 1 / 4 / 8 users; decide from that.
-4. Tests offline first, as in Phase 1; one rented test pod (~$3.50 for ~1 h).
+Built and tested offline, **not yet run on a real pod**:
+- `strata-on --engine vllm [--name N] [--context 128k]` rents 2x RTX PRO 6000 (`profiles/vllm.env`), starts
+  `profiles/vllm-start.sh` (fetches the recipe's chat template from a pinned commit, checks its sha256, then
+  `vllm serve` with the recipe's flags and `cpu_offload: false`), waits on vLLM's `/v1/models`, smoke-tests
+  `/v1/messages`. `strata-cc`, `strata-codex`, `strata-status`, `strata-dash` and `strata-off` work the same.
+- Tests: `tests/test_strata_pod.sh` (T45-T50) and `tests/test_payload.sh` (the real create request).
+
+Next:
+1. One rented test pod (~$3.50 for ~1 h): first boot, `/dev/shm` and the GPU-resident PLE tables are the risks.
+2. A concurrency bench with Claude-Code-sized prompts (26-40k tokens) at 1 / 4 / 8 users; decide from that.
 
 ## Later
 

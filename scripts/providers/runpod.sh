@@ -87,6 +87,15 @@ cuda = env("RUNPOD_ALLOWED_CUDA", "")
 if cuda:
     payload["gpu"]["allowedCudaVersions"] = [c.strip() for c in cuda.split(",") if c.strip()]
 
+# container start command, as JSON arrays: RUNPOD_ENTRYPOINT_JSON='["bash","-c"]', RUNPOD_CMD_JSON='["..."]'
+for key, var in (("entrypoint", "RUNPOD_ENTRYPOINT_JSON"), ("cmd", "RUNPOD_CMD_JSON")):
+    raw = env(var, "")
+    if raw:
+        val = json.loads(raw)
+        if not (isinstance(val, list) and all(isinstance(x, str) for x in val)):
+            sys.exit(f"{var} must be a JSON array of strings")
+        payload[key] = val
+
 data_centers = env("RUNPOD_DATA_CENTER_IDS", "")
 if data_centers:
     payload["dataCenterIds"] = [d.strip() for d in data_centers.split(",") if d.strip()]

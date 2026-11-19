@@ -26,7 +26,7 @@ setup() {
 #!/bin/bash
 printf '%s\n' "cards=$1" "args=${*:2}" "PROFILE=${PROFILE:-}" "POD_ENV=${RUNPOD_POD_ENV:-}" \
   "INSTANCE_NAME=${INSTANCE_NAME:-}" "HUNT_RUN=${HUNT_RUN:-}" "RESULT=${HUNT_RESULT_FILE:-}" \
-  "RUNPOD_API_KEY=${RUNPOD_API_KEY:-}" > "$STUB/hunt.log"
+  "RUNPOD_API_KEY=${RUNPOD_API_KEY:-}" "ENTRY=${RUNPOD_ENTRYPOINT_JSON:-}" "CMD=${RUNPOD_CMD_JSON:-}" > "$STUB/hunt.log"
 [ "${HUNT_FAIL:-0}" = 1 ] && { echo "no gpu caught; nothing billed" >&2; exit 1; }
 [ -n "${HUNT_RESULT_FILE:-}" ] || { echo "no HUNT_RESULT_FILE" >&2; exit 1; }
 echo "{\"id\":\"${FAKE_POD_ID:-fake123}\",\"gpu\":{\"id\":\"NVIDIA GeForce RTX 5080\"}}" > "$HUNT_RESULT_FILE"
@@ -621,6 +621,92 @@ check "exit non-zero" '[ $rc != 0 ]'
 check "says the key is missing" 'echo "$out" | grep -q "RUNPOD_API_KEY is not set"'
 check "does not claim a hunt ran" '! echo "$out" | grep -qi "no GPU caught"'
 check "no hunt" '[ ! -f "$STUB/hunt.log" ]'
+
+VLLM_MODELS='{"code":200,"body":{"object":"list","data":[{"id":"qwen3.8-flash-next","object":"model","max_model_len":131072}]}}'
+PODV='{"code":200,"body":{"id":"fake123","status":"RUNNING","cost":3.38,"gpu":{"id":"NVIDIA RTX PRO 6000 Blackwell Server Edition","count":2,"memory":188},"env":{"VLLM_API_KEY":"k","MAX_MODEL_LEN":"131072"}}}'
+
+echo "== T45: strata-on --engine vllm -> 2x RTX PRO 6000 profile, vLLM command, no Strata env, no memory PATCH"
+setup
+routes <<EOF
+{"GET rp.test/v2/pods/fake123": [$PODV], "PATCH rp.test/v2/pods/fake123": [$PODV],
+ "GET fake123.strata.test/v1/models": [{"code":502,"body":"x"}, $VLLM_MODELS],
+ "POST fake123.strata.test/v1/messages": [$MSG_OK]}
+EOF
+out=$("$POD" on --engine vllm 2>&1); rc=$?
+echo "$out" | tail -3 | sed 's/^/    | /'
+check "exit 0" '[ $rc = 0 ]'
+check "profile vllm" 'grep -qx "PROFILE=vllm" "$STUB/hunt.log"'
+check "default card RTX PRO 6000" 'grep -qx "cards=NVIDIA RTX PRO 6000 Blackwell Server Edition" "$STUB/hunt.log"'
+check "pod env: VLLM_API_KEY and MAX_MODEL_LEN=131072 only" 'grep -q "POD_ENV=VLLM_API_KEY=[0-9a-f]\{48\},MAX_MODEL_LEN=131072$" "$STUB/hunt.log"'
+check "no Strata env (FAMILY/MODEL/CONTEXT)" '! grep -qE "POD_ENV=.*(FAMILY|MODEL=IQ|CONTEXT)" "$STUB/hunt.log"'
+check "container command is the vllm start script" 'grep -q "^CMD=\[.*vllm serve" "$STUB/hunt.log"'
+check "no memory-limit PATCH (Strata-only)" '! calls | grep "\"PATCH\"" | grep -q memory-limit'
+check "state records engine vllm" 'python3 -c "import json,sys;assert json.load(open(sys.argv[1]))[\"engine\"]==\"vllm\"" "$STRATA_CONF_DIR/pods/1.json"'
+check "ready on vLLM-shaped /v1/models (max_model_len)" 'echo "$out" | grep -q "context 131072"'
+check "url uses port 8000" 'calls | grep -q "fake123.strata.test/v1/models"'
+
+echo "== T46: strata-cc on a vLLM pod -> served model id and max_model_len"
+setup
+mkdir -p "$STRATA_CONF_DIR/pods"; echo '{"pod_id":"fake123","engine":"vllm"}' > "$STRATA_CONF_DIR/pods/1.json"
+umask 077; echo "STRATA_API_KEY=x" > "$STRATA_CONF_DIR/env"; umask 022
+routes <<< "{\"GET fake123.strata.test/v1/models\": [$VLLM_MODELS]}"
+"$POD" cc >/dev/null 2>&1; rc=$?
+check "exit 0" '[ $rc = 0 ]'
+check "model alias = qwen3.8-flash-next" 'grep -qx "ANTHROPIC_MODEL=qwen3.8-flash-next" "$STUB/claude.env"'
+check "context from max_model_len" 'grep -qx "CLAUDE_CODE_MAX_CONTEXT_TOKENS=131072" "$STUB/claude.env"'
+
+echo "== T47: running vLLM pod on 262144, strata-on wants 128k -> PATCH MAX_MODEL_LEN=131072"
+setup
+mkdir -p "$STRATA_CONF_DIR/pods"; echo '{"pod_id":"fake123","engine":"vllm"}' > "$STRATA_CONF_DIR/pods/1.json"
+umask 077; echo "STRATA_API_KEY=x" > "$STRATA_CONF_DIR/env"; umask 022
+PODV262='{"code":200,"body":{"id":"fake123","status":"RUNNING","cost":3.38,"gpu":{"memory":188},"env":{"VLLM_API_KEY":"k","MAX_MODEL_LEN":"262144"}}}'
+VM262='{"code":200,"body":{"data":[{"id":"qwen3.8-flash-next","max_model_len":262144}]}}'
+routes <<EOF
+{"GET rp.test/v2/pods/fake123": [$PODV262], "PATCH rp.test/v2/pods/fake123": [$PODV],
+ "GET fake123.strata.test/v1/models": [$VM262, {"code":502,"body":"x"}, $VLLM_MODELS],
+ "POST fake123.strata.test/v1/messages": [$MSG_OK]}
+EOF
+out=$("$POD" on 2>&1); rc=$?
+check "exit 0" '[ $rc = 0 ]'
+check "PATCH MAX_MODEL_LEN 131072" 'calls | grep "\"PATCH\"" | grep -q "MAX_MODEL_LEN[^,]*131072"'
+check "PATCH has no Strata CONTEXT" '! calls | grep "\"PATCH\"" | grep -q "\"CONTEXT"'
+check "kept the engine (no hunt)" '[ ! -f "$STUB/hunt.log" ]'
+
+echo "== T48: unknown --engine refused before anything is rented"
+setup
+routes <<< '{}'
+out=$("$POD" on --engine llamacpp 2>&1); rc=$?
+check "exit non-zero" '[ $rc != 0 ] && [ ! -f "$STUB/hunt.log" ]'
+
+echo "== T49: --engine vllm --context auto is refused (vLLM needs a number)"
+setup
+routes <<< '{}'
+out=$("$POD" on --engine vllm --context auto 2>&1); rc=$?
+check "exit non-zero, no hunt" '[ $rc != 0 ] && [ ! -f "$STUB/hunt.log" ]'
+
+echo "== T50: status --json carries the engine"
+setup
+mkdir -p "$STRATA_CONF_DIR/pods"; echo '{"pod_id":"fake123","engine":"vllm"}' > "$STRATA_CONF_DIR/pods/1.json"
+umask 077; echo "STRATA_API_KEY=x" > "$STRATA_CONF_DIR/env"; umask 022
+routes <<EOF
+{"GET rp.test/v2/pods/fake123": [$PODV], "GET fake123.strata.test/v1/models": [$VLLM_MODELS],
+ "POST graphql": [{"code":200,"body":{"data":{"myself":{"clientBalance":9,"currentSpendPerHr":3.38}}}}]}
+EOF
+"$POD" status --json > "$STUB/s.json" 2>/dev/null
+check "engine vllm, loaded, ctx 131072" 'python3 -c "import json,sys;p=json.load(open(sys.argv[1]))[\"pods\"][0];assert p[\"engine\"]==\"vllm\" and p[\"loaded\"] and p[\"ctx\"]==131072" "$STUB/s.json"'
+
+echo "== T51: strata-status on a pod RunPod no longer has (auto-terminated) -> says so, forgets it"
+setup
+mkdir -p "$STRATA_CONF_DIR/pods"; echo '{"pod_id":"gone9","ttl_until":"2026-11-18 23:52"}' > "$STRATA_CONF_DIR/pods/1.json"
+routes <<< '{"GET rp.test/v2/pods/gone9": [{"code":404,"body":{"status":404,"detail":"pod not found"}}], "POST graphql": [{"code":200,"body":{"data":{"myself":{"clientBalance":8.77,"currentSpendPerHr":0}}}}]}'
+out=$("$POD" status 2>&1); rc=$?
+echo "$out" | sed 's/^/    | /'
+check "exit 0" '[ $rc = 0 ]'
+check "says it is gone and nothing bills" 'echo "$out" | grep -qi "gone" && echo "$out" | grep -qi "not billing"'
+check "names the auto-terminate time" 'echo "$out" | grep -q "23:52"'
+check "says how to start a new one" 'echo "$out" | grep -q "strata-on"'
+check "no Strata probe of a dead pod" '! grep -q "strata.test" "$STUB/calls.log"'
+check "record cleared" '[ ! -f "$STRATA_CONF_DIR/pods/1.json" ]'
 
 python3 -c 'import glob,shutil,sys; [shutil.rmtree(d) for d in glob.glob(sys.argv[1] + "/t.*")]' "$WORK"
 echo
