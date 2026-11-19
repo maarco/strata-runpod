@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+source "$ROOT_DIR/scripts/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+usage:
+  scripts/gpu-instance create [--dry-run]
+  scripts/gpu-instance list
+  scripts/gpu-instance status <container_id>
+  scripts/gpu-instance ssh <container_id>
+  scripts/gpu-instance terminate <container_id>
+EOF
+}
+
+main() {
+  local command="${1:-}"
+  if [[ -z "$command" || "$command" == "-h" || "$command" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+  shift || true
+
+  load_env
+  local provider="${PROVIDER:-runpod}"
+  local provider_file="$ROOT_DIR/scripts/providers/${provider}.sh"
+  if [[ ! -f "$provider_file" ]]; then
+    die "provider adapter not found: $provider_file"
+  fi
+  # shellcheck source=/dev/null
+  source "$provider_file"
+
+  case "$command" in
+    create) provider_create "$@" ;;
+    list) provider_list "$@" ;;
+    status) provider_status "$@" ;;
+    ssh) provider_ssh "$@" ;;
+    terminate) provider_terminate "$@" ;;
+    *)
+      usage
+      die "unknown command: $command"
+      ;;
+  esac
+}
+
+main "$@"

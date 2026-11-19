@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# retry `create` until capacity shows up. scarce gpus (blackwell 6000, b200)
+# sit at stockStatus=Low and fail creation with a 500 most of the time, so the
+# only reliable way to get one is to keep asking.
+#
+# usage: scripts/gpu-hunt [--interval SECONDS] [--deadline MINUTES] [--yes]
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/lib/common.sh"
+
+INTERVAL=30
+DEADLINE_MIN=60
+ASSUME_YES="false"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --interval) INTERVAL="$2"; shift 2 ;;
+    --deadline) DEADLINE_MIN="$2"; shift 2 ;;
+    --yes) ASSUME_YES="true"; shift ;;
+    -h|--help)
+      sed -n '3,9p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) die "unknown flag: $1" ;;
+  esac
+done
+
+load_env
+provider="${PROVIDER:-runpod}"
+[[ "$provider" == "runpod" ]] || die "gpu-hunt only supports PROVIDER=runpod (got: $provider)"
+source "$ROOT_DIR/scripts/providers/runpod.sh"
+
+require_cmd curl
+require_cmd python3
+[[ -n "${RUNPOD_API_KEY:-}" ]] || die "RUNPOD_API_KEY is not set"
+
+# HUNT_TAG keeps parallel hunts (scripts/gpu-hunt-many) from sharing files.
+# HUNT_WON_DIR: first hunt to mkdir it wins; any other hunt that catches a pod
+# afterwards deletes its own pod at once, so a race never leaves two billing.
+tag="${HUNT_TAG:+-$HUNT_TAG}"
+won_dir="${HUNT_WON_DIR:-}"
+payload_file="$(runtime_file "runpod-hunt$tag.json")"
+runpod_payload "$(read_public_key)" > "$payload_file"
+
+gpus="$(python3 -c "import json,sys;print(', '.join([json.load(open(sys.argv[1]))['gpu']['id']]))" "$payload_file")"
+attempts=$(( DEADLINE_MIN * 60 / INTERVAL ))
+[[ "$attempts" -lt 1 ]] && attempts=1
+
+printf '▲ hunting for paid gpu capacity\n' >&2
+printf '  gpus:     %s\n' "$gpus" >&2
+printf '  name:     %s\n' "${INSTANCE_NAME:-strata}" >&2
+printf '  volume:   %s\n' "${RUNPOD_NETWORK_VOLUME_ID:-<pod volume>}" >&2
+printf '  retry:    every %ss for up to %s min (%s attempts)\n' "$INTERVAL" "$DEADLINE_MIN" "$attempts" >&2
+printf '  NOTE:     billing starts the moment one is caught\n' >&2
+
+if [[ "$ASSUME_YES" != "true" ]]; then
+  printf 'type hunt to continue: ' >&2
+  read -r confirm
+  [[ "$confirm" == "hunt" ]] || die "hunt cancelled"
+fi
+
+body="$(runtime_file "runpod-hunt-response$tag.json")"
+for (( i=1; i<=attempts; i++ )); do
+  if [[ -n "$won_dir" && -d "$won_dir" ]]; then
+    printf '\n  another hunt already caught a pod; stopping\n' >&2
+    exit 0
+  fi
+  # the api answers 500 for "no capacity", so a failed curl is expected here
+  # and must not kill the loop
+  if runpod_api POST /pods "$payload_file" > "$body" 2>/dev/null; then
+    id="$(python3 -c "
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+print(d.get('id',''))
+" "$body" 2>/dev/null || true)"
+    if [[ -n "$id" && -n "$won_dir" ]] && ! mkdir "$won_dir" 2>/dev/null; then
+      printf '\n  lost the race; deleting my extra pod %s\n' "$id" >&2
+      runpod_api DELETE "/pods/$id" >/dev/null 2>&1 \
+        || printf '✖ FAILED to delete extra pod %s — run scripts/gpu-reap\n' "$id" >&2
+      exit 0
+    fi
+    if [[ -n "$id" ]]; then
+      printf '\n✔ caught capacity after %s attempt(s): %s\n' "$i" "$id" >&2
+      cp "$body" "$(runtime_file runpod-last-create.json)"
+      [[ -n "${HUNT_RESULT_FILE:-}" ]] && cp "$body" "$HUNT_RESULT_FILE"
+      python3 -m json.tool < "$body"
+      exit 0
+    fi
+  fi
+
+  reason="$(python3 -c "
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    # v2 errors are problem+json: {status, title, detail}
+    print(d.get('status',''), (d.get('detail') or d.get('error') or '')[:90])
+except Exception:
+    print('')
+" "$body" 2>/dev/null || true)"
+  # retrying only helps capacity errors; auth/balance/bad-request never fix themselves
+  # v2 answers "no capacity" with a 400 too, so match the text before giving up
+  case "$reason" in
+    *"no longer any instances"*|*capacity*|*available*) ;;
+    400\ *|401\ *|402\ *|403\ *|422\ *) printf '\n' >&2; die "runpod refused the create: $reason" ;;
+  esac
+  printf '\r  [%s/%s] no capacity%s        ' "$i" "$attempts" "${reason:+ — $reason}" >&2
+  sleep "$INTERVAL"
+done
+
+printf '\n' >&2
+die "no capacity within ${DEADLINE_MIN} min; nothing was created and nothing billed"

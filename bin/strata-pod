@@ -1,0 +1,576 @@
+#!/usr/bin/env bash
+# Strata (github.com/Niko1221/Strata) on a rented RunPod GPU, driven from this Mac.
+#
+# Several pods at once: every command takes a leading --name N (or STRATA_POD=N in the environment);
+# no name means pod 1. strata-status with no name lists every pod; strata-off --all ends every pod.
+#
+#   strata-on [--context 128k|64k|256k|N|auto] [--hours H] [--model M] [--cards "A|B"] [--deadline MIN]
+#                         rent (or reuse / restart) a pod, cap its memory, arm the auto-terminate timer,
+#                         wait for the model, smoke-test it
+#   strata-pod setup      store your RunPod API key (once per computer)
+#   strata-cc [claude args...]   Claude Code against the pod (Strata's own Claude Code settings)
+#   strata-codex [codex args...] Codex CLI against the pod (Strata's own Codex settings)
+#   strata-dash           live status window with the connect commands
+#   strata-status [--json]  pod, price, timer, model, last speed, RunPod balance
+#   strata-env [--show-key]      exports for other apps (Anthropic and OpenAI style)
+#   strata-extend H       re-arm the auto-terminate timer to H hours from now
+#   strata-logs           the pod's recent container log
+#   strata-off [--keep]   terminate the pod (--keep: stop it and keep its disk, which still bills)
+#
+# Speed settings are Strata's own defaults; the only engine setting added is memory-limit-mib, which Strata's
+# docs name for a container that cannot see its own RAM limit (RunPod's case).
+# Pieces: scripts/ (gpu-hunt-many, gpu-ttl), profiles/strata.env. Keys: ~/.config/strata-runpod/.
+# Tests: bash tests/test_strata_pod.sh
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")")/.." && pwd)"
+LCR="${STRATA_LCR:-$REPO}"
+CONF="${STRATA_CONF_DIR:-$HOME/.config/strata-runpod}"
+KEYFILE="$CONF/env"
+RP_BASE="${RUNPOD_API_BASE:-https://api.runpod.io/v2}"
+RP_GRAPHQL="${RUNPOD_GRAPHQL_URL:-https://api.runpod.io/graphql}"
+URL_FMT="${STRATA_URL_FMT:-https://%s-8080.proxy.runpod.net}"
+read -r -a CURL <<< "${STRATA_CURL:-curl}"
+CLAUDE_BIN="${STRATA_CLAUDE:-claude}"
+POLL_S="${STRATA_POLL_S:-30}"
+READY_TIMEOUT_S="${STRATA_READY_TIMEOUT_S:-4500}"
+
+DEFAULT_CARDS="NVIDIA GeForce RTX 5080|NVIDIA GeForce RTX 4080 SUPER|NVIDIA GeForce RTX 4080"
+DEFAULT_MODEL="IQ3_XXS"
+DEFAULT_HOURS="3"
+DEFAULT_DEADLINE_MIN="30"
+DEFAULT_CONTEXT="128k"   # Marco's use case; --context auto lets Strata choose
+
+say()  { printf '%s\n' "$*" >&2; }
+die()  { printf 'strata: %s\n' "$*" >&2; exit 1; }
+
+mkdir -p "$CONF/pods"; chmod 700 "$CONF"
+# one state file per named pod; the single-pod state.json of the first version is pod 1
+if [[ -f "$CONF/state.json" && ! -f "$CONF/pods/1.json" ]]; then mv "$CONF/state.json" "$CONF/pods/1.json"; fi
+
+use_pod() {   # use_pod NAME: point STATE at that pod's file
+  [[ "$1" =~ ^[A-Za-z0-9_-]{1,20}$ ]] || die "pod names are 1-20 letters, digits, - or _ (got: '$1')"
+  PNAME="$1"; STATE="$CONF/pods/$PNAME.json"
+}
+nm() { [[ "$PNAME" == 1 ]] || printf ' --name %s' "$PNAME"; }   # how to name this pod in a printed command
+lbl() { [[ "$PNAME" == 1 ]] || printf ' named %s' "$PNAME"; }
+all_pods() { local f; for f in "$CONF"/pods/*.json; do [[ -e "$f" ]] && basename "$f" .json; done; return 0; }
+
+# ---- http: one curl shape, so the fake curl in the tests covers every call ----------------------------
+# http METHOD URL TOKEN [JSON] -> sets HTTP_CODE and HTTP_BODY; never exits on a failed request
+http() {
+  local args=(-sS --max-time "${HTTP_MAX_TIME:-30}" -X "$1" -H "Authorization: Bearer $3"
+              -H "User-Agent: strata-pod/1" -w '\n%{http_code}')
+  local f=""
+  if [[ -n "${4:-}" ]]; then
+    f="$(mktemp "$CONF/.body.XXXXXX")"        # bodies can hold the key: keep them in the private dir
+    printf '%s' "$4" > "$f"
+    args+=(-H "Content-Type: application/json" --data-binary "@$f")
+  fi
+  local out
+  out="$("${CURL[@]}" "${args[@]}" "$2" 2>/dev/null)" || true
+  [[ -n "$f" ]] && rm -f "$f"
+  HTTP_CODE="${out##*$'\n'}"
+  if [[ "$out" == *$'\n'* ]]; then HTTP_BODY="${out%$'\n'*}"; else HTTP_BODY=""; fi
+  [[ "$HTTP_CODE" =~ ^[0-9]+$ ]] || HTTP_CODE=0
+}
+ok() { [[ "$HTTP_CODE" =~ ^2 ]]; }
+# json EXPR: evaluate a python expression on the JSON in $HTTP_BODY (as `d`); empty on any error
+json() { printf '%s' "$HTTP_BODY" | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin); v=($1)
+    print('' if v is None else v)
+except Exception:
+    print('')" 2>/dev/null; }
+
+RP_KEY=""
+load_runpod_key() {   # the shell profile exports RUNPOD_API_KEY; llm-cloud-runtime/.env is the fallback
+  [[ -n "$RP_KEY" ]] && return 0
+  RP_KEY="${RUNPOD_API_KEY:-}"
+  local f
+  for f in "$LCR/.env" "$CONF/runpod.env"; do
+    [[ -n "$RP_KEY" ]] && break
+    RP_KEY="$(grep -E '^RUNPOD_API_KEY=' "$f" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'")" || true
+  done
+  [[ -n "$RP_KEY" ]] || die "RUNPOD_API_KEY is not set. Run: strata-pod setup   (or export RUNPOD_API_KEY=...)"
+}
+rp() { load_runpod_key; http "$1" "$RP_BASE$2" "$RP_KEY" "${3:-}"; }
+
+ensure_key() {
+  if [[ ! -s "$KEYFILE" ]]; then
+    (umask 077; printf 'STRATA_API_KEY=%s\n' "$(openssl rand -hex 24)" > "$KEYFILE")
+  fi
+  chmod 600 "$KEYFILE"
+}
+strata_key() { grep -E '^STRATA_API_KEY=' "$KEYFILE" 2>/dev/null | tail -1 | cut -d= -f2-; }
+pod_url() { printf "$URL_FMT" "$1"; }
+st() { http "$1" "$(pod_url "$POD")$2" "$(strata_key)" "${3:-}"; }
+
+state_get() { python3 -c 'import json,sys
+try: print(json.load(open(sys.argv[1])).get(sys.argv[2],""))
+except Exception: print("")' "$STATE" "$1"; }
+state_set() {   # state_set key value [key value ...] (merges)
+  python3 - "$STATE" "$@" <<'PY'
+import json, os, sys
+p = sys.argv[1]
+try: d = json.load(open(p))
+except Exception: d = {}
+a = sys.argv[2:]
+for k, v in zip(a[::2], a[1::2]): d[k] = v
+tmp = p + ".tmp"
+json.dump(d, open(tmp, "w"), indent=1); os.replace(tmp, p)
+PY
+}
+state_clear() { rm -f "$STATE"; }
+
+ttl_arm() {   # ttl_arm POD HOURS
+  "$LCR/scripts/gpu-ttl" "$1" "$2" >&2
+  state_set ttl_until "$(python3 -c "import time,sys;print(time.strftime('%Y-%m-%d %H:%M',time.localtime(time.time()+float(sys.argv[1])*3600)))" "$2")"
+}
+ttl_cancel() { "$LCR/scripts/gpu-ttl" --cancel "$1" >&2 || true; }
+
+# ---- strata-on ----------------------------------------------------------------------------------------
+memory_limit_mib() {   # RunPod's per-pod RAM figure is decimal GB and equals the container's cgroup limit
+  python3 -c "import sys;print(int(float(sys.argv[1])*1e9/1048576) - 2048)" "$1"
+}
+
+cap_memory() {   # PATCH the pod env with memory-limit-mib for this pod's real RAM (restarts the container early)
+  local mem env_json limit
+  rp GET "/pods/$POD"
+  mem="$(json 'd["gpu"]["memory"]')"
+  [[ -n "$mem" ]] || { say "! could not read pod RAM; leaving Strata to plan from what it sees"; return 0; }
+  limit="$(memory_limit_mib "$mem")"
+  env_json="$(printf '%s' "$HTTP_BODY" | python3 -c 'import json,sys
+d=json.load(sys.stdin); e=dict(d.get("env") or {})
+parts=[p for p in e.get("STRATA_SET","").split() if not p.startswith("memory-limit-mib=")]
+e["STRATA_SET"]=" ".join(parts+["memory-limit-mib="+sys.argv[1]])
+print(json.dumps({"env":e}))' "$limit")"
+  rp PATCH "/pods/$POD" "$env_json"
+  ok && say "memory cap: ${mem} GB pod -> memory-limit-mib=$limit" || say "! memory cap PATCH failed (HTTP $HTTP_CODE)"
+}
+
+context_tokens() {   # 128k -> 131072, 65536 -> 65536, auto/other -> empty
+  case "$1" in
+    *[kK]) [[ "${1%[kK]}" =~ ^[0-9]+$ ]] && echo $(( ${1%[kK]} * 1024 )) ;;
+    *) [[ "$1" =~ ^[0-9]+$ ]] && echo "$1" ;;
+  esac
+  return 0
+}
+
+# a running pod on another context: PATCH CONTEXT (keeps the rest of its env) and wait for the old server to go
+ensure_context() {
+  local want="$1" want_tok have body i
+  [[ "$want" == auto ]] && want=""
+  want_tok="$(context_tokens "$want")"
+  rp GET "/pods/$POD"
+  ok || { say "! could not read pod $POD env (HTTP $HTTP_CODE); context left as is"; return 0; }
+  have="$(json 'd.get("env",{}).get("CONTEXT","")')"
+  [[ "$have" == "$want" ]] && return 0
+  body="$(printf '%s' "$HTTP_BODY" | python3 -c 'import json,sys
+e=dict(json.load(sys.stdin).get("env") or {})
+if sys.argv[1]: e["CONTEXT"]=sys.argv[1]
+else: e.pop("CONTEXT",None)
+print(json.dumps({"env":e}))' "$want")"
+  rp PATCH "/pods/$POD" "$body"
+  ok || { say "! context change failed (HTTP $HTTP_CODE); still on ${have:-auto}"; return 0; }
+  say "context ${have:-auto} -> ${want:-auto}: restarting Strata (about 2-6 min; the model stays on disk)"
+  for (( i = 0; i < 36; i++ )); do   # up to ~3 min for the old server to stop answering
+    HTTP_MAX_TIME=10 st GET /v1/models
+    ok || return 0
+    [[ -n "$want_tok" && "$(json 'd["data"][0]["meta"]["n_ctx"]')" == "$want_tok" ]] && return 0
+    sleep $(( POLL_S > 5 ? 5 : POLL_S ))
+  done
+}
+
+hunt() {   # rent a pod; prints the pod id
+  local cards="$1" model="$2" deadline="$3" context="$4" pod_env
+  pod_env="FAMILY=qwen,MODEL=$model,API_KEY=$(strata_key)"
+  [[ "$context" != auto ]] && pod_env+=",CONTEXT=$context"
+  local result="$LCR/.runtime/strata-$PNAME-create.json"
+  rm -f "$result"
+  if ! ( cd "$LCR" && PROFILE=strata INSTANCE_NAME="strata-$PNAME" HUNT_RUN="$PNAME" HUNT_RESULT_FILE="$result" \
+         RUNPOD_POD_ENV="$pod_env" \
+         scripts/gpu-hunt-many "$cards" --yes --interval 30 --deadline "$deadline" ) >&2; then
+    die "no GPU caught within ${deadline} min; nothing billed. Try again, or add cards with --cards"
+  fi
+  python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["id"])' "$result"
+}
+
+last_progress() {   # the newest useful line of the container log, or empty
+  HTTP_MAX_TIME=6 rp GET "/pods/$POD/logs"
+  printf '%s' "$HTTP_BODY" | python3 -c 'import re,sys
+keep=re.compile(r"Download|Getting|Loading|Tuning|Starting|Checking|Preparing|Packing|ready|serving|\[X\]|rror")
+lines=[m.group(1) for m in re.finditer(r"\"line\":\"((?:[^\"\\\\]|\\\\.)*)\"", sys.stdin.read())]
+lines=[l.strip() for l in lines if keep.search(l) and "high memory" not in l]
+print(lines[-1] if lines else "")' 2>/dev/null || true
+}
+
+wait_ready() {
+  local start now last="" p
+  start="$(date +%s)"
+  while :; do
+    HTTP_MAX_TIME=15 st GET /v1/models
+    if ok && [[ "$(json 'd["data"][0]["status"]["value"]')" == loaded ]]; then
+      MODEL_ID="$(json 'd["data"][0]["id"]')"; CTX="$(json 'd["data"][0]["meta"]["n_ctx"]')"
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now - start >= READY_TIMEOUT_S )); then
+      say "Strata on pod $POD is not ready after $(( (now - start) / 60 )) min (HTTP $HTTP_CODE). The pod is still billing."
+      say "  look: strata-status / strata-logs      stop it: strata-off"
+      return 1
+    fi
+    p="$(last_progress)"
+    if [[ -n "$p" && "$p" != "$last" ]]; then say "  $(date +%H:%M) $p"; last="$p"; fi
+    sleep "$POLL_S"
+  done
+}
+
+smoke() {
+  local body text
+  body="$(python3 -c 'import json,sys;print(json.dumps({"model":sys.argv[1],"max_tokens":64,"thinking":{"type":"disabled"},
+"messages":[{"role":"user","content":"Reply with just the word: ok"}]}))' "$MODEL_ID")"
+  HTTP_MAX_TIME=120 st POST /v1/messages "$body"
+  if ok; then
+    text="$(json '"".join(b.get("text","") for b in d.get("content",[]) if b.get("type")=="text").strip()')"
+    say "smoke test: /v1/messages answered \"${text:0:40}\""
+  else
+    say "! smoke test: /v1/messages returned HTTP $HTTP_CODE"
+    return 1
+  fi
+}
+
+cmd_on() {
+  local hours="$DEFAULT_HOURS" model="$DEFAULT_MODEL" cards="$DEFAULT_CARDS" deadline="$DEFAULT_DEADLINE_MIN"
+  local context="$DEFAULT_CONTEXT"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --hours) hours="$2"; shift 2 ;;
+      --model) model="$2"; shift 2 ;;
+      --cards) cards="$2"; shift 2 ;;
+      --deadline) deadline="$2"; shift 2 ;;
+      --context) context="$2"; shift 2 ;;
+      -h|--help) sed -n '2,20p' "$0"; return 0 ;;
+      *) die "unknown flag for strata-on: $1" ;;
+    esac
+  done
+  [[ "$context" == auto || -n "$(context_tokens "$context")" ]] \
+    || die "--context takes auto, a size like 64k / 128k / 256k, or a token count (got: $context)"
+  ensure_key
+  POD="$(state_get pod_id)"
+  local fresh=0 restarted=0 status
+  if [[ -n "$POD" ]]; then
+    rp GET "/pods/$POD"
+    status="$(json 'd.get("status","")')"
+    if ok && [[ "$status" =~ ^(RUNNING|STARTING|PROVISIONING)$ ]]; then
+      say "already running: pod $POD ($status)"
+    elif ok && [[ "$status" == EXITED ]]; then
+      say "pod $POD is stopped; starting it (keeps the downloaded model)"
+      rp POST "/pods/$POD/action" '{"action":"start"}'
+      if ok; then
+        restarted=1
+      else
+        say "! pod $POD could not start: $(json 'd.get("detail") or d.get("error") or ""') (HTTP $HTTP_CODE)"
+        say "  it is still stopped and its disk still bills; delete it with: strata-off --pod $POD"
+        POD=""
+      fi
+    elif [[ "$HTTP_CODE" == 404 ]] || [[ "$status" =~ ^(TERMINATED|ERROR)$ ]]; then
+      say "pod $POD is gone ($status${status:+, }HTTP $HTTP_CODE); renting a new one"
+      POD=""; state_clear
+    else
+      die "cannot read pod $POD from RunPod (HTTP $HTTP_CODE); nothing changed"
+    fi
+  fi
+  if [[ -z "$POD" ]]; then
+    say "renting a GPU (Q3 $model, context $context, cards: $cards)"
+    POD="$(hunt "$cards" "$model" "$deadline" "$context")"
+    state_clear
+    state_set pod_id "$POD" model "$model" created "$(date '+%Y-%m-%d %H:%M')"
+    fresh=1
+  fi
+  if (( fresh )); then cap_memory; fi
+  if (( fresh || restarted )); then ttl_arm "$POD" "$hours"; fi
+  (( fresh )) || ensure_context "$context"
+  say "waiting for Strata on pod $POD (first start downloads ~77 GB, about 20-25 min)"
+  wait_ready || return 1
+  local want_tok; want_tok="$(context_tokens "$context")"
+  if [[ -n "$want_tok" && "$CTX" != "$want_tok" ]]; then
+    say "! asked for $want_tok tokens of context, Strata serves $CTX (likely the most that fits this card)"
+  fi
+  smoke || true
+  local cost; rp GET "/pods/$POD"; cost="$(json 'd.get("cost","?")')"
+  say ""
+  say "ready: $MODEL_ID, context $CTX, pod $POD, \$${cost}/hr, auto-terminate $(state_get ttl_until)"
+  say "  claude code:  strata-cc$(nm)            (any claude flags pass through)"
+  say "  other apps:   strata-env$(nm)           status: strata-status     stop: strata-off$(nm)"
+}
+
+# ---- strata-cc ----------------------------------------------------------------------------------------
+cmd_cc() {
+  POD="$(state_get pod_id)"
+  [[ -n "$POD" ]] || die "no Strata pod$(lbl). Start one with: strata-on$(nm)"
+  HTTP_MAX_TIME=20 st GET /v1/models
+  if ! ok || [[ "$(json 'd["data"][0]["status"]["value"]')" != loaded ]]; then
+    die "Strata on pod $POD is not answering yet (HTTP $HTTP_CODE). Check: strata-status$(nm)"
+  fi
+  local model ctx out_cap
+  model="$(json 'd["data"][0]["id"]')"; ctx="$(json 'd["data"][0]["meta"]["n_ctx"]')"
+  [[ "$ctx" =~ ^[0-9]+$ ]] || ctx=32768
+  out_cap=$(( ctx / 8 > 4096 ? ctx / 8 : 4096 ))   # Strata's harness.py output_cap: max(4096, context/8)
+  unset ANTHROPIC_API_KEY CLAUDE_CODE_SIMPLE
+  ANTHROPIC_BASE_URL="$(pod_url "$POD")"; ANTHROPIC_AUTH_TOKEN="$(strata_key)"
+  export ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN
+  export ANTHROPIC_MODEL="$model" ANTHROPIC_SMALL_FAST_MODEL="$model"
+  export ANTHROPIC_DEFAULT_SONNET_MODEL="$model" ANTHROPIC_DEFAULT_OPUS_MODEL="$model" ANTHROPIC_DEFAULT_HAIKU_MODEL="$model"
+  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 DISABLE_TELEMETRY=1
+  export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$ctx" CLAUDE_CODE_MAX_OUTPUT_TOKENS="$out_cap"
+  (( ctx <= 40960 )) && export CLAUDE_CODE_SIMPLE=1
+  # Claude Code's auto-mode safety classifier cannot run behind a non-Anthropic server (tools get denied),
+  # and Marco runs bypass anyway: bypass by default, unless a permission flag was given.
+  local a perm=()
+  for a in "$@"; do [[ "$a" == --permission-mode* || "$a" == --dangerously-skip-permissions ]] && perm=(none); done
+  (( ${#perm[@]} )) && perm=() || perm=(--dangerously-skip-permissions)
+  say "claude code -> $model on pod $POD (context $ctx, output cap $out_cap${perm:+, bypass permissions})"
+  exec "$CLAUDE_BIN" "${perm[@]}" "$@"
+}
+
+# ---- strata-off ---------------------------------------------------------------------------------------
+cmd_off() {
+  local keep=0 all=0 podarg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --keep) keep=1; shift ;;
+      --all) all=1; shift ;;
+      --pod) podarg="$2"; shift 2 ;;
+      *) die "unknown flag for strata-off: $1" ;;
+    esac
+  done
+  if (( all )); then
+    local n bad=0 any=0
+    for n in $(all_pods); do any=1; use_pod "$n"; POD="$(state_get pod_id)"; off_one "$keep" || bad=1; done
+    (( any )) || say "no Strata pods recorded; nothing to stop."
+    return "$bad"
+  fi
+  POD="${podarg:-$(state_get pod_id)}"
+  if [[ -z "$POD" ]]; then
+    say "no Strata pod$(lbl) recorded; nothing to stop. Anything else billing: $LCR/scripts/gpu-reap --dry-run"
+    return 0
+  fi
+  off_one "$keep" || exit 1
+}
+
+off_one() {   # off_one KEEP: stop or terminate $POD; non-zero if RunPod refused
+  if (( $1 )); then
+    rp POST "/pods/$POD/action" '{"action":"stop"}'
+    ok || { say "strata: stop failed for pod $POD (HTTP $HTTP_CODE). Check: $LCR/scripts/gpu-reap --dry-run"; return 1; }
+    ttl_cancel "$POD"
+    local gb; gb="$(grep -E '^RUNPOD_VOLUME_GB=' "$LCR/profiles/strata.env" 2>/dev/null | cut -d= -f2)"; gb="${gb:-120}"
+    say "[$PNAME] stopped pod $POD. The GPU is released; its ${gb} GB disk (the downloaded model) still bills while stopped:"
+    say "  \$0.20/GB/month = \$$(( gb / 5 ))/month (RunPod's stopped-pod volume rate, docs.runpod.io/pods/pricing)."
+    say "  strata-on$(nm) starts it again if its GPU is free; strata-off$(nm) deletes it for good."
+  else
+    rp DELETE "/pods/$POD"
+    if ok || [[ "$HTTP_CODE" == 404 ]]; then
+      ttl_cancel "$POD"
+      [[ "$POD" == "$(state_get pod_id)" ]] && state_clear
+      say "[$PNAME] terminated pod $POD; nothing from it bills now."
+    else
+      say "strata: DELETE pod $POD failed (HTTP $HTTP_CODE); it may still bill. Kill it with: $LCR/scripts/gpu-reap"
+      return 1
+    fi
+  fi
+}
+
+# ---- strata-status / env / extend / logs --------------------------------------------------------------
+balance() {
+  load_runpod_key
+  http POST "$RP_GRAPHQL" "$RP_KEY" '{"query":"query{myself{clientBalance currentSpendPerHr}}"}'
+  ok && say "runpod: balance \$$(json 'round(d["data"]["myself"]["clientBalance"],2)'), spending \$$(json 'd["data"]["myself"]["currentSpendPerHr"]')/hr"
+}
+
+cmd_status() {
+  [[ "${1:-}" == --json ]] && { status_json; return 0; }
+  local n any=0
+  if (( NAME_EXPLICIT )); then
+    status_one
+  else
+    for n in $(all_pods); do any=1; use_pod "$n"; status_one; done
+    (( any )) || say "no Strata pods. Start one: strata-on"
+  fi
+  balance || true
+}
+
+status_one() {
+  POD="$(state_get pod_id)"
+  if [[ -z "$POD" ]]; then say "[$PNAME] no pod. Start one: strata-on$(nm)"; return 0; fi
+  rp GET "/pods/$POD"
+  if ok; then
+    say "[$PNAME] pod $POD: $(json 'd["status"]'), $(json 'd["gpu"]["id"]'), \$$(json 'd.get("cost","?")')/hr, auto-terminate $(state_get ttl_until)"
+  else
+    say "[$PNAME] pod $POD: RunPod says HTTP $HTTP_CODE"
+  fi
+  HTTP_MAX_TIME=15 st GET /v1/models
+  if ok; then
+    say "    strata: $(json 'd["data"][0]["id"]') $(json 'd["data"][0]["status"]["value"]'), context $(json 'd["data"][0]["meta"]["n_ctx"]')"
+    HTTP_MAX_TIME=15 st GET /metrics
+    if ok; then
+      local r; r="$(json '"%s tok/s decode on a %s-token prompt" % (r["decode_tok_s"], r["prompt_tokens"]) if (r := next((x for x in d.get("requests", []) if x.get("output_tokens", 0) >= 32), None)) else ""')"
+      [[ -n "$r" ]] && say "    last request: $r"
+    fi
+  else
+    say "    strata: not answering (HTTP $HTTP_CODE)  latest log: $(last_progress)"
+  fi
+  return 0
+}
+
+cmd_setup() {
+  local key=""
+  if [[ -t 0 ]]; then
+    say "RunPod API key (runpod.io > Settings > API Keys; needs read/write on pods). Typing is hidden."
+    read -r -s -p "RUNPOD_API_KEY: " key; echo >&2
+  else
+    read -r key || true
+  fi
+  key="$(printf '%s' "$key" | tr -d '[:space:]')"
+  [[ -n "$key" ]] || die "no key given"
+  (umask 077; printf 'RUNPOD_API_KEY=%s\n' "$key" > "$CONF/runpod.env")
+  chmod 600 "$CONF/runpod.env"
+  RP_KEY="$key"
+  ensure_key
+  if balance; then say "saved to $CONF/runpod.env (only you can read it). Next: strata-on"
+  else die "RunPod did not accept that key (HTTP $HTTP_CODE); saved anyway, run strata-pod setup again to replace it"; fi
+}
+
+cmd_codex() {
+  POD="$(state_get pod_id)"
+  [[ -n "$POD" ]] || die "no Strata pod$(lbl). Start one with: strata-on$(nm)"
+  HTTP_MAX_TIME=20 st GET /v1/models
+  if ! ok || [[ "$(json 'd["data"][0]["status"]["value"]')" != loaded ]]; then
+    die "Strata on pod $POD is not answering yet (HTTP $HTTP_CODE). Check: strata-status$(nm)"
+  fi
+  local model ctx input compact
+  model="$(json 'd["data"][0]["id"]')"; ctx="$(json 'd["data"][0]["meta"]["n_ctx"]')"
+  [[ "$ctx" =~ ^[0-9]+$ ]] || ctx=32768
+  # Strata harness.py: input limit = ctx - 4096; compact at the share the tested 32K config used (15000 of 28672)
+  input=$(( ctx - 4096 > 1024 ? ctx - 4096 : 1024 ))
+  compact=$(( input * 15000 / 28672 > 15000 ? input * 15000 / 28672 : 15000 ))
+  STRATA_API_KEY="$(strata_key)"; export STRATA_API_KEY
+  # a clean Codex home by default: a personal ~/.codex (memories, global instructions, hooks) can fill the
+  # window before the first message. STRATA_CODEX_HOME=~/.codex uses yours.
+  CODEX_HOME="${STRATA_CODEX_HOME:-$CONF/codex-home}"; mkdir -p "$CODEX_HOME"; export CODEX_HOME
+  say "codex -> $model on pod $POD (context $ctx, compacts at $compact)"
+  exec "${STRATA_CODEX:-codex}" \
+    -c "model=\"$model\"" -c 'model_provider="strata"' \
+    -c "model_context_window=$ctx" -c "model_auto_compact_token_limit=$compact" \
+    -c 'model_reasoning_summary="auto"' -c 'approval_policy="never"' -c 'sandbox_mode="workspace-write"' \
+    -c 'check_for_update_on_startup=false' \
+    -c 'model_providers.strata.name="Strata"' \
+    -c "model_providers.strata.base_url=\"$(pod_url "$POD")/v1\"" \
+    -c 'model_providers.strata.wire_api="responses"' -c 'model_providers.strata.env_key="STRATA_API_KEY"' \
+    -c 'model_providers.strata.stream_idle_timeout_ms=600000' \
+    "$@"
+}
+
+status_json_one() {   # one pod as a JSON object on stdout
+  local pod_body="" models_body="" metrics_body="" progress=""
+  POD="$(state_get pod_id)"
+  [[ -n "$POD" ]] || return 0
+  rp GET "/pods/$POD"; ok && pod_body="$HTTP_BODY"
+  HTTP_MAX_TIME=15 st GET /v1/models; ok && models_body="$HTTP_BODY"
+  if [[ -n "$models_body" ]]; then HTTP_MAX_TIME=15 st GET /metrics; ok && metrics_body="$HTTP_BODY"
+  else progress="$(last_progress)"; fi
+  python3 -c '
+import json, sys
+name, pod, ttl, url, progress, pb, mb, xb = sys.argv[1:9]
+def load(t):
+    try: return json.loads(t)
+    except Exception: return {}
+p, m, x = load(pb), load(mb), load(xb)
+md = (m.get("data") or [{}])[0]
+live = x.get("live") or {}
+req = next((r for r in x.get("requests", []) if r.get("output_tokens", 0) >= 32), None)
+print(json.dumps({"name": name, "pod_id": pod, "status": p.get("status", "UNKNOWN"),
+    "gpu": (p.get("gpu") or {}).get("id", ""), "cost": p.get("cost"), "ttl_until": ttl,
+    "model": md.get("id", ""), "ctx": (md.get("meta") or {}).get("n_ctx"),
+    "loaded": (md.get("status") or {}).get("value") == "loaded",
+    "live_state": live.get("state") or "", "live_tok_s": live.get("tok_s"),
+    "last_decode_tok_s": req.get("decode_tok_s") if req else None,
+    "last_prompt_tokens": req.get("prompt_tokens") if req else None,
+    "progress": progress, "base_url": url}))' \
+    "$PNAME" "$POD" "$(state_get ttl_until)" "$(pod_url "$POD")" "$progress" "$pod_body" "$models_body" "$metrics_body"
+}
+
+status_json() {
+  local n rows=() bal="" spend=""
+  if (( NAME_EXPLICIT )); then rows+=("$(status_json_one)")
+  else for n in $(all_pods); do use_pod "$n"; rows+=("$(status_json_one)"); done; fi
+  load_runpod_key
+  http POST "$RP_GRAPHQL" "$RP_KEY" '{"query":"query{myself{clientBalance currentSpendPerHr}}"}'
+  if ok; then bal="$(json 'd["data"]["myself"]["clientBalance"]')"; spend="$(json 'd["data"]["myself"]["currentSpendPerHr"]')"; fi
+  printf '%s\n' "${rows[@]+"${rows[@]}"}" | python3 -c 'import json,sys
+rows=[json.loads(l) for l in sys.stdin if l.strip()]
+f=lambda v: float(v) if v not in ("", None) else None
+print(json.dumps({"balance": f(sys.argv[1]), "spend_per_hr": f(sys.argv[2]), "pods": rows}, indent=1))' "$bal" "$spend"
+}
+
+cmd_env() {
+  local show=0; [[ "${1:-}" == --show-key ]] && show=1
+  POD="$(state_get pod_id)"; [[ -n "$POD" ]] || die "no Strata pod$(lbl). Start one: strata-on$(nm)"
+  local key; key="$(strata_key)"; (( show )) || key="${key:0:6}...(strata-env --show-key)"
+  HTTP_MAX_TIME=15 st GET /v1/models
+  local model; model="$(json 'd["data"][0]["id"]')"
+  cat <<EOF
+# Anthropic-style apps (Claude Code, Agent SDK): base has no /v1
+export ANTHROPIC_BASE_URL=$(pod_url "$POD")
+export ANTHROPIC_AUTH_TOKEN=$key
+# OpenAI-style apps (OpenCode, Codex, SDKs, curl)
+export OPENAI_BASE_URL=$(pod_url "$POD")/v1
+export OPENAI_API_KEY=$key
+# model: ${model:-?}
+EOF
+}
+
+cmd_extend() {
+  local hours="${1:-}"; [[ "$hours" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "usage: strata-extend HOURS"
+  POD="$(state_get pod_id)"; [[ -n "$POD" ]] || die "no Strata pod$(lbl). Start one: strata-on$(nm)"
+  ttl_cancel "$POD"
+  ttl_arm "$POD" "$hours"
+  say "pod $POD now auto-terminates at $(state_get ttl_until)"
+}
+
+cmd_logs() {
+  POD="$(state_get pod_id)"; [[ -n "$POD" ]] || die "no Strata pod$(lbl). Start one: strata-on$(nm)"
+  HTTP_MAX_TIME=8 rp GET "/pods/$POD/logs"
+  printf '%s' "$HTTP_BODY" | python3 -c 'import re,sys
+for m in re.finditer(r"\"line\":\"((?:[^\"\\\\]|\\\\.)*)\"", sys.stdin.read()):
+    l=m.group(1)
+    if "high memory" not in l: print(l)' | tail -n "${1:-40}"
+}
+
+name="$(basename "$0")"
+case "$name" in
+  strata-on|strata-cc|strata-codex|strata-off|strata-status|strata-env|strata-extend|strata-logs) sub="${name#strata-}" ;;
+  *) sub="${1:-help}"; shift || true ;;
+esac
+NAME_EXPLICIT=0
+if [[ "${1:-}" == --name ]]; then
+  [[ $# -ge 2 ]] || die "--name needs a value"
+  use_pod "$2"; NAME_EXPLICIT=1; shift 2
+elif [[ -n "${STRATA_POD:-}" ]]; then
+  use_pod "$STRATA_POD"; NAME_EXPLICIT=1
+else
+  use_pod 1
+fi
+case "$sub" in
+  on) cmd_on "$@" ;;
+  cc) cmd_cc "$@" ;;
+  codex) cmd_codex "$@" ;;
+  setup) cmd_setup "$@" ;;
+  dash) exec python3 "$REPO/bin/strata-dash" "$@" ;;
+  off) cmd_off "$@" ;;
+  status) cmd_status "$@" ;;
+  env) cmd_env "$@" ;;
+  extend) cmd_extend "$@" ;;
+  logs) cmd_logs "$@" ;;
+  *) sed -n '2,20p' "$0" ;;
+esac

@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""strata-dash: a live status window for your Strata pods, with the commands to connect.
+
+    strata-dash            full-screen, refreshes every 10 s (q quits, r refreshes now)
+    strata-dash --once     print one snapshot and exit (no curses; works over ssh, in logs, in tests)
+    strata-dash --every 5  refresh interval in seconds
+
+It only reads: it runs `strata-pod status --json` (STRATA_STATUS_CMD overrides that, for tests).
+"""
+import curses
+import json
+import os
+import shlex
+import subprocess
+import sys
+import threading
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+STATUS_CMD = shlex.split(os.environ.get("STRATA_STATUS_CMD", "")) or [os.path.join(HERE, "strata-pod"), "status", "--json"]
+
+
+def fetch():
+    try:
+        out = subprocess.run(STATUS_CMD, capture_output=True, text=True, timeout=120)
+        if out.returncode != 0 and not out.stdout.strip():
+            return {"error": (out.stderr.strip().splitlines() or ["status failed"])[-1]}
+        return json.loads(out.stdout)
+    except Exception as e:  # a dashboard must keep running whatever the status call does
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def short_gpu(g):
+    return (g or "?").replace("NVIDIA ", "").replace("GeForce ", "")
+
+
+def hhmm(ttl):
+    return ttl[-5:] if ttl else "-"
+
+
+def money(v):
+    return "?" if v is None else f"${v:.2f}"
+
+
+def flag(name):
+    return "" if name == "1" else f" --name {name}"
+
+
+def render(data, width=100):
+    """The screen as a list of (text, style) lines. style: '' | 'title' | 'ok' | 'warn' | 'dim'."""
+    lines = []
+    now = time.strftime("%H:%M:%S")
+    if "error" in data:
+        return [("Strata on RunPod", "title"), (f"could not read status: {data['error']}", "warn"),
+                ("check: strata-status   (is RUNPOD_API_KEY set? run strata-pod setup)", "dim")]
+    pods = data.get("pods") or []
+    head = f"Strata on RunPod   balance {money(data.get('balance'))}   spending {money(data.get('spend_per_hr'))}/hr   {now}"
+    lines.append((head, "title"))
+    lines.append(("-" * min(width - 1, len(head) + 10), "dim"))
+    if not pods:
+        lines += [("No pods running.", ""), ("  start one:   strata-on            (first start downloads the model, ~25 min)", ""),
+                  ("  a second:    strata-on --name 2", "dim")]
+        return lines
+    for p in pods:
+        if p.get("loaded"):
+            state = f"ready, {p.get('model')}, context {p.get('ctx')}"
+            style = "ok"
+        elif p.get("status") in ("RUNNING", "STARTING", "PROVISIONING"):
+            state = f"loading: {p.get('progress') or 'starting'}"
+            style = "warn"
+        else:
+            state = p.get("status", "?")
+            style = "warn"
+        cost = "?" if p.get("cost") is None else f"${p['cost']}/hr"
+        lines.append((f"[{p['name']}] {p['pod_id']}  {short_gpu(p.get('gpu'))}  {cost}  "
+                      f"auto-off {hhmm(p.get('ttl_until'))}   {state}", style))
+        if p.get("loaded"):
+            live = p.get("live_state") or "idle"
+            speed = f" {p['live_tok_s']:.0f} tok/s" if p.get("live_tok_s") else ""
+            last = ""
+            if p.get("last_decode_tok_s"):
+                last = f"   last reply {p['last_decode_tok_s']:.0f} tok/s on a {p.get('last_prompt_tokens')}-token prompt"
+            lines.append((f"     now: {live}{speed}{last}", "dim"))
+    for p in pods:
+        f = flag(p["name"])
+        url = p.get("base_url", "")
+        lines += [("", ""), (f"Connect to pod {p['name']}" + ("" if p.get("loaded") else "  (once it says ready)"), "title"),
+                  (f"  Claude Code     strata-cc{f}", ""),
+                  (f"  Codex           strata-codex{f}", ""),
+                  (f"  Anthropic API   ANTHROPIC_BASE_URL={url}", ""),
+                  (f"  OpenAI API      {url}/v1", ""),
+                  (f"  API key         strata-env{f} --show-key", "dim")]
+    lines += [("", ""), ("more time: strata-extend 2    another pod: strata-on --name 2    stop: strata-off    stop all: strata-off --all", "dim")]
+    return lines
+
+
+def run_curses(every):
+    state = {"data": {"pods": [], "balance": None, "spend_per_hr": None}, "at": 0.0, "busy": False}
+
+    def refresh():
+        state["busy"] = True
+        state["data"] = fetch()
+        state["at"] = time.time()
+        state["busy"] = False
+
+    def main(scr):
+        curses.curs_set(0)
+        scr.timeout(500)
+        if curses.has_colors():
+            curses.use_default_colors()
+            for i, c in enumerate((curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_YELLOW), 1):
+                curses.init_pair(i, c, -1)
+        styles = {"title": curses.color_pair(1) | curses.A_BOLD, "ok": curses.color_pair(2),
+                  "warn": curses.color_pair(3), "dim": curses.A_DIM, "": 0}
+        threading.Thread(target=refresh, daemon=True).start()
+        while True:
+            if not state["busy"] and time.time() - state["at"] > every:
+                threading.Thread(target=refresh, daemon=True).start()
+            h, w = scr.getmaxyx()
+            scr.erase()
+            for y, (text, style) in enumerate(render(state["data"], w)[: h - 1]):
+                scr.addnstr(y, 0, text, w - 1, styles.get(style, 0))
+            note = "refreshing..." if state["busy"] else f"q quit   r refresh   (every {every}s)"
+            scr.addnstr(h - 1, 0, note, w - 1, curses.A_DIM)
+            scr.refresh()
+            k = scr.getch()
+            if k in (ord("q"), 27):
+                return
+            if k == ord("r") and not state["busy"]:
+                threading.Thread(target=refresh, daemon=True).start()
+
+    curses.wrapper(main)
+
+
+def main(argv):
+    every = 10
+    if "--every" in argv:
+        every = max(2, int(argv[argv.index("--every") + 1]))
+    if "--once" in argv or not sys.stdout.isatty():
+        for text, _ in render(fetch()):
+            print(text)
+        return 0
+    try:
+        run_curses(every)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

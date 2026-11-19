@@ -1,0 +1,6 @@
+.env
+.runtime/
+.test-tmp*
+__pycache__/
+*.log
+.DS_Store

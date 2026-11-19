@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# spend cap: terminate a pod after N hours, no prompt. runs detached.
+# usage: scripts/gpu-ttl <pod_id> <hours>     cancel: scripts/gpu-ttl --cancel <pod_id>
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/lib/common.sh"
+
+if [[ "${1:-}" == "--cancel" ]]; then
+  pidf="$(runtime_file "ttl-$2.pid")"
+  if [[ -f "$pidf" ]]; then
+    pid="$(cat "$pidf")"
+    pkill -P "$pid" 2>/dev/null || true      # its sleep child, or it lingers as an orphan
+    kill "$pid" 2>/dev/null || true
+    rm -f "$pidf"; info "ttl cancelled for $2"
+  fi
+  exit 0
+fi
+
+id="${1:?pod_id}"; hours="${2:?hours}"
+load_env
+source "$ROOT_DIR/scripts/providers/runpod.sh"
+log="$(runtime_file "ttl-$id.log")"
+secs="$(python3 -c "print(int(float('$hours')*3600))")"
+nohup bash -c "
+  ROOT_DIR='$ROOT_DIR'; sleep $secs
+  source '$ROOT_DIR/scripts/lib/common.sh'; load_env; source '$ROOT_DIR/scripts/providers/runpod.sh'
+  if runpod_api DELETE '/pods/$id' >/dev/null 2>&1; then echo \"\$(date) terminated $id\"; else echo \"\$(date) FAILED to terminate $id\"; fi
+" >> "$log" 2>&1 &
+echo "$!" > "$(runtime_file "ttl-$id.pid")"
+info "pod $id will be terminated at $(date -v+${secs}S '+%H:%M') (log: .runtime/ttl-$id.log)"

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# run one gpu-hunt per gpu type at once; the first catch wins and the rest stop
+# (a hunt that catches a pod after the winner deletes it straight away).
+# usage: scripts/gpu-hunt-many "GPU A|GPU B|..." [gpu-hunt flags]
+#   other settings come from .env / PROFILE as for gpu-hunt.
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/lib/common.sh"
+
+[[ $# -ge 1 ]] || die "usage: scripts/gpu-hunt-many \"GPU A|GPU B\" [gpu-hunt flags]"
+IFS='|' read -r -a gpus <<< "$1"
+shift
+
+# HUNT_RUN=<name> keeps hunts for different pods (strata-on --name) from sharing files
+run="${HUNT_RUN:+-$HUNT_RUN}"
+HUNT_WON_DIR="$(runtime_file "hunt-won$run")"
+HUNT_RESULT_FILE="${HUNT_RESULT_FILE:-$(runtime_file "runpod-last-create$run.json")}"
+export HUNT_WON_DIR HUNT_RESULT_FILE
+rm -f "$HUNT_RESULT_FILE"
+rmdir "$HUNT_WON_DIR" 2>/dev/null || true
+
+pids=()
+for g in "${gpus[@]}"; do
+  g="$(printf '%s' "$g" | sed 's/^ *//; s/ *$//')"
+  tag="$(printf '%s' "$g" | tr -cs 'A-Za-z0-9' '-' | tr 'A-Z' 'a-z')"
+  RUNPOD_GPU_TYPE_ID="$g" HUNT_TAG="$tag$run" "$ROOT_DIR/scripts/gpu-hunt" "$@" \
+    > "$(runtime_file "hunt$run-$tag.log")" 2>&1 &
+  pids+=("$!")
+  info "hunting $g (log: .runtime/hunt$run-$tag.log)"
+done
+
+for p in "${pids[@]}"; do wait "$p" || true; done
+
+if [[ -d "$HUNT_WON_DIR" ]]; then
+  info "caught: $(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d["id"], d.get("gpu",{}).get("id",""))' "$HUNT_RESULT_FILE")"
+else
+  die "no gpu caught; nothing billed"
+fi

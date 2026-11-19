@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# kill every running pod on the account. a safety net: if the auto-terminate
+# timer died (kill -9, a closed laptop, a crashed shell) nothing else stops a
+# gpu that keeps billing. this is the backstop.
+#
+# usage:
+#   scripts/gpu-reap            # list what is running and ask
+#   scripts/gpu-reap --yes      # terminate everything, no prompt
+#   scripts/gpu-reap --dry-run  # just show what is running
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/lib/common.sh"
+
+ASSUME_YES=false
+DRY_RUN=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --yes) ASSUME_YES=true; shift ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    -h|--help) sed -n '3,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown flag: $1" ;;
+  esac
+done
+
+load_env
+source "$ROOT_DIR/scripts/providers/runpod.sh"
+require_cmd curl; require_cmd python3
+[[ -n "${RUNPOD_API_KEY:-}" ]] || die "RUNPOD_API_KEY is not set"
+
+list_file="$(runtime_file runpod-reap.json)"
+runpod_api GET /pods > "$list_file"
+
+mapfile -t ids < <(python3 - "$list_file" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+pods = d if isinstance(d, list) else d.get("pods", [])
+for p in pods:
+    if p.get("status") != "TERMINATED":
+        print(p["id"])
+PY
+)
+
+if [[ ${#ids[@]} -eq 0 ]]; then
+  printf '✔ nothing running — you are not being billed for any pod\n'
+  exit 0
+fi
+
+python3 - "$list_file" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+pods = d if isinstance(d, list) else d.get("pods", [])
+total = 0.0
+print(f"{'id':<20} {'$/hr':>7}  name")
+for p in pods:
+    if p.get("status") == "TERMINATED":
+        continue
+    rate = p.get("cost") or 0
+    total += float(rate)
+    print(f"{p.get('id','?'):<20} {rate:>7}  {p.get('name','')}")
+print(f"\nburn rate: ${total:.2f}/hr  =  ${total*24:.2f}/day")
+PY
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  exit 0
+fi
+
+if [[ "$ASSUME_YES" != "true" ]]; then
+  printf '\nterminate ALL %s pod(s)? type reap: ' "${#ids[@]}" >&2
+  read -r confirm
+  [[ "$confirm" == "reap" ]] || die "cancelled — pods still running"
+fi
+
+for id in "${ids[@]}"; do
+  if runpod_api DELETE "/pods/$id" >/dev/null 2>&1; then
+    printf '✔ terminated %s\n' "$id"
+  else
+    printf '✖ FAILED to terminate %s — kill it in the runpod console\n' "$id" >&2
+  fi
+done
